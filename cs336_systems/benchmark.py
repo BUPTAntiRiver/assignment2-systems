@@ -9,6 +9,7 @@ The script does the following:
 import cs336_basics.model
 import cs336_basics.nn_utils
 import torch
+import torch.cuda.nvtx as nvtx
 import timeit
 import argparse
 import math
@@ -94,20 +95,22 @@ def _summarize(times_s):
     p95 = sorted_times[p95_idx]
     return {"mean": mean, "std": std, "p50": p50, "p95": p95}
 
+@nvtx.range("benchmark_iteration")
 def benchmark_iteration():
     # Important for correctness (and stable perf): don't accumulate grads across iters.
     model.zero_grad(set_to_none=True)
 
     # Ensure prior async GPU work is not attributed to this iter.
     _sync()
-    forward_start = timeit.default_timer()
+    with nvtx.range("forward"):
+        forward_start = timeit.default_timer()
 
-    logits = model(input_data)
-    loss = None
-    if args.include_loss_in_forward:
-        loss = cs336_basics.nn_utils.cross_entropy(
-            logits.reshape(-1, args.vocab_size), target_labels.reshape(-1)
-        )
+        logits = model(input_data)
+        loss = None
+        if args.include_loss_in_forward:
+            loss = cs336_basics.nn_utils.cross_entropy(
+                logits.reshape(-1, args.vocab_size), target_labels.reshape(-1)
+            )
 
     _sync()
     forward_end = timeit.default_timer()
@@ -118,16 +121,18 @@ def benchmark_iteration():
         )
 
     _sync()
-    backward_start = timeit.default_timer()
-    loss.backward()
-    _sync()
-    backward_end = timeit.default_timer()
+    with nvtx.range("backward"):
+        backward_start = timeit.default_timer()
+        loss.backward()
+        _sync()
+        backward_end = timeit.default_timer()
 
     opt_time = 0.0
     if optimizer is not None:
         _sync()
-        opt_start = timeit.default_timer()
-        optimizer.step()
+        with nvtx.range("optimizer_step"):
+            opt_start = timeit.default_timer()
+            optimizer.step()
         _sync()
         opt_end = timeit.default_timer()
         opt_time = opt_end - opt_start
@@ -161,7 +166,7 @@ def main():
     o = _summarize(o_times) if optimizer is not None else None
 
     tokens_per_iter = args.batch_size * args.context_length
-    step_mean = f["mean"] + b["mean"] + ((o["mean"] if o is not None else 0.0))
+    step_mean = f["mean"] + b["mean"] + (o["mean"] if o is not None else 0.0)
 
     print(f"Device: {device}")
     print(f"Batch size: {args.batch_size}, Context length: {args.context_length} (tokens/iter={tokens_per_iter})")
