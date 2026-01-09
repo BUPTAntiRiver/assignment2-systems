@@ -19,17 +19,18 @@ from tqdm import tqdm
 parser = argparse.ArgumentParser()
 
 # Model hyperparameters
-parser.add_argument("--d_model", type=int, default=768, help="Dimension of model")
-parser.add_argument("--d_ff", type=int, default=3072, help="Dimension of feedforward layer")
-parser.add_argument("--num_layers", type=int, default=12, help="Number of layers")
-parser.add_argument("--num_heads", type=int, default=12, help="Number of attention heads")
+parser.add_argument("--d_model", type=int, default=128, help="Dimension of model")
+parser.add_argument("--d_ff", type=int, default=512, help="Dimension of feedforward layer")
+parser.add_argument("--num_layers", type=int, default=4, help="Number of layers")
+parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads")
 parser.add_argument("--context_length", type=int, default=128, help="Context length")
-parser.add_argument("--vocab_size", type=int, default=30522, help="Vocabulary size")
+parser.add_argument("--vocab_size", type=int, default=10000, help="Vocabulary size")
 
 # Benchmarking hyperparameters
 parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
 parser.add_argument("--warmup_iters", type=int, default=5, help="Number of warmup iterations")
 parser.add_argument("--measure_iters", type=int, default=10, help="Number of measurement iterations")
+parser.add_argument("--dtype", type=str, default="float32", help="Data type to use (float32, float16, bfloat16)")
 
 parser.add_argument(
     "--include_loss_in_forward",
@@ -105,12 +106,13 @@ def benchmark_iteration():
     with nvtx.range("forward"):
         forward_start = timeit.default_timer()
 
-        logits = model(input_data)
-        loss = None
-        if args.include_loss_in_forward:
-            loss = cs336_basics.nn_utils.cross_entropy(
-                logits.reshape(-1, args.vocab_size), target_labels.reshape(-1)
-            )
+        with torch.autocast(device_type=device.type, dtype=getattr(torch, args.dtype), cache_enabled=True):
+            logits = model(input_data)
+            loss = None
+            if args.include_loss_in_forward:
+                loss = cs336_basics.nn_utils.cross_entropy(
+                    logits.reshape(-1, args.vocab_size), target_labels.reshape(-1)
+                )
 
     _sync()
     forward_end = timeit.default_timer()
