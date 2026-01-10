@@ -144,3 +144,155 @@ class FlashAttentionPytorch(torch.autograd.Function):
             dV: Gradient of value
         """
         pass
+
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
+):
+    # Program indices
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    # Offset each pointer with the corresponding batch index
+    # multiplied with the batch stride for each tensor
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    m = tl.full([Q_TILE_SIZE], float('-inf'), dtype=tl.float32)
+
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    o = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES),
+        strides=(stride_lq),
+        offsets=(query_tile_index * Q_TILE_SIZE),
+        block_shape=(Q_TILE_SIZE),
+        order=(0),
+    )
+
+    l = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
+
+    for key_tile_index in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        s = tl.dot(q, k.T) * scale
+
+        if is_causal:
+            q_indices = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
+            k_indices = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
+            mask = q_indices[:, None] < k_indices[None, :]
+            s = tl.where(mask, -1e6, s)
+
+        m_new = tl.max(m, tl.max(s, axis=-1))
+
+        alpha = tl.exp(m - m_new)
+
+        p = tl.exp(s - m_new[:, None])
+
+        l_new = alpha * l + tl.sum(p, axis=-1)
+
+        o = alpha[:, None] * o + tl.dot(p.to(V_block_ptr.type.element_ty), v)
+
+        m = m_new
+        l = l_new
+
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    o = o / l[:, None]
+    
+    tl.store(O_block_ptr, o.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(L_block_ptr, m + tl.log(l), boundary_check=(0))
+
+
+class FlashAttentionTriton(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        is_causal: bool = False
+    ):
+        O = torch.empty_like(Q)
+        L = torch.empty_like((Q.shape[0], Q.shape[1]), device=Q.device, dtype=torch.float32)
+
+        Q_TILE_SIZE = 16
+        K_TILE_SIZE = 16
+
+        grid = (tl.cdiv(Q.shape[1], Q_TILE_SIZE), Q.shape[0])
+
+        flash_fwd_kernel[grid](
+            Q, K, V, O, L,
+            *Q.stride(), *K.stride(), *V.stride(),
+            *O.stride(), *L.stride(),
+            Q.shape[1], K.shape[1],
+            1.0 / (Q.shape[-1] ** 0.5),
+            Q.shape[-1],
+            Q_TILE_SIZE, K_TILE_SIZE,
+            is_causal,
+        )
+
+        # Save tensors for backward pass
+        ctx.save_for_backward(Q, K, V, O, L)
+        ctx.is_causal = is_causal
+        ctx.d = Q.shape[-1]
+        
+        return O
+
+    def backward(
+            ctx: torch.autograd.function.FunctionCtx,
+            dO: torch.Tensor,
+        ):
+        pass
