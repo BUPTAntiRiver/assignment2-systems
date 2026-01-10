@@ -130,7 +130,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
         return O
     
     @staticmethod
-    def backward(ctx, dO):
+    def backward(ctx: torch.autograd.function.FunctionCtx, dO: torch.Tensor):
         """
         Backward pass of Flash Attention using recomputation.
         
@@ -143,7 +143,24 @@ class FlashAttentionPytorch(torch.autograd.Function):
             dK: Gradient of key
             dV: Gradient of value
         """
-        pass
+        Q, K, V, O, L = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        d = ctx.d
+
+        D = torch.sum(O * dO, dim=-1)
+        S = einsum(Q, K, "... Q d, ... K d -> ... Q K") / (d ** 0.5)
+        if is_causal:
+            n_queries = Q.shape[1]
+            n_keys = K.shape[1]
+            mask = torch.arange(n_queries, device=Q.device)[:, None] < torch.arange(n_keys, device=Q.device)[None, :]
+            S = torch.where(mask, -1e6, S)
+        P = torch.exp(S - rearrange(L, "... -> ... 1"))
+        dV = einsum(P, dO, "... Q K, ... Q d -> ... K d")
+        dP = einsum(dO, V, "... Q d, ... K d -> ... Q K")
+        dS = P * (dP - rearrange(D, "... -> ... 1"))
+        dQ = dS @ K / (d ** 0.5)
+        dK = einsum(dS, Q, "... Q K, ... Q d -> ... K d") / (d ** 0.5)
+        return dQ, dK, dV, None
 
 
 @triton.jit
@@ -197,7 +214,7 @@ def flash_fwd_kernel(
         order=(1, 0),
     )
 
-    m = tl.full([Q_TILE_SIZE], float('-inf'), dtype=tl.float32)
+    m = tl.full([Q_TILE_SIZE], -1e6, dtype=tl.float32)
 
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_ob,
