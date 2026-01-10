@@ -308,8 +308,35 @@ class FlashAttentionTriton(torch.autograd.Function):
         
         return O
 
-    def backward(
-            ctx: torch.autograd.function.FunctionCtx,
-            dO: torch.Tensor,
-        ):
-        pass
+    @staticmethod
+    def backward(ctx: torch.autograd.function.FunctionCtx, dO: torch.Tensor):
+        """
+        Backward pass of Flash Attention using recomputation.
+        
+        Args:
+            ctx: Autograd context
+            dO: Gradient of output (batch_size, n_queries, d)
+        
+        Returns:
+            dQ: Gradient of query
+            dK: Gradient of key
+            dV: Gradient of value
+        """
+        Q, K, V, O, L = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        d = ctx.d
+
+        D = torch.sum(O * dO, dim=-1)
+        S = einsum(Q, K, "... Q d, ... K d -> ... Q K") / (d ** 0.5)
+        if is_causal:
+            n_queries = Q.shape[1]
+            n_keys = K.shape[1]
+            mask = torch.arange(n_queries, device=Q.device)[:, None] < torch.arange(n_keys, device=Q.device)[None, :]
+            S = torch.where(mask, -1e6, S)
+        P = torch.exp(S - rearrange(L, "... -> ... 1"))
+        dV = einsum(P, dO, "... Q K, ... Q d -> ... K d")
+        dP = einsum(dO, V, "... Q d, ... K d -> ... Q K")
+        dS = P * (dP - rearrange(D, "... -> ... 1"))
+        dQ = dS @ K / (d ** 0.5)
+        dK = einsum(dS, Q, "... Q K, ... Q d -> ... K d") / (d ** 0.5)
+        return dQ, dK, dV, None
