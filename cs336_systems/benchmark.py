@@ -48,6 +48,7 @@ parser.add_argument(
     action="store_true",
     help="If set, show progress bars (can add overhead for small benchmarks).",
 )
+parser.add_argument("--compile", action="store_true", help="If set, use torch.compile on the model.")
 
 args = parser.parse_args()
 
@@ -63,6 +64,9 @@ model = cs336_basics.model.BasicsTransformerLM(
     d_ff=args.d_ff,
     rope_theta=100000,
 )
+
+if args.compile:
+    model = torch.compile(model)
 
 model.to(device)
 model.train()
@@ -156,13 +160,18 @@ def main():
     measure_iter = range(args.measure_iters)
     if args.use_tqdm:
         measure_iter = tqdm(measure_iter, desc="Measurement")
+
+    if device.type == "cuda":
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
     for _ in measure_iter:
         f_time, b_time, o_time = benchmark_iteration()
         f_times.append(f_time)
         b_times.append(b_time)
         if optimizer is not None:
             o_times.append(o_time)
-
+    if device.type == "cuda":
+        torch.cuda.memory._dump_memory_history("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
     f = _summarize(f_times)
     b = _summarize(b_times)
     o = _summarize(o_times) if optimizer is not None else None
