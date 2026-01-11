@@ -14,11 +14,6 @@ class ShardedOptimizerWrapper(torch.optim.Optimizer):
 
 
     def step(self, closure=None, **kwargs):
-        # broadcast grads
-        for param in self.param_to_rank:
-            if param.grad is not None:
-                dist.broadcast(param.grad, src=self.param_to_rank[param])
-
         # perform local step
         self.optimizer.step(closure, **kwargs)
     
