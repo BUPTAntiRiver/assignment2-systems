@@ -65,9 +65,17 @@ def distributed_train(rank, world_size):
         
         # Measure communication time
         comm_start = time.time()
-        for param in model.parameters():
-            dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-            param.grad.data /= world_size
+
+        dense_gradients = [param.grad.data for param in model.parameters()]
+        flat_grads = torch._utils._flatten_dense_tensors(dense_gradients)
+        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM, async_op=False)
+        flat_grads.div_(world_size)
+        torch._utils._unflatten_dense_tensors(flat_grads, dense_gradients)
+        
+        # for param in model.parameters():
+        #     dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+        #     param.grad.data.div_(world_size)
+
         comm_end = time.time()
         comm_times.append(comm_end - comm_start)
         
