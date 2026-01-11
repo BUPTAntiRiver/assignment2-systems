@@ -16,12 +16,12 @@ def distributed_train(rank, world_size):
     setup(rank, world_size)
     
     model = BasicsTransformerLM(
-        vocab_size=64,
-        context_length=64,
-        d_model=64,
-        num_layers=2,
-        num_heads=4,
-        d_ff=256,
+        vocab_size=512,
+        context_length=128,
+        d_model=256,
+        num_layers=4,
+        num_heads=8,
+        d_ff=1024,
         rope_theta=100000,
     )
     
@@ -33,7 +33,7 @@ def distributed_train(rank, world_size):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     model.train()
     
-    local_bs = 8  # Each rank processes 8 examples
+    local_bs = 16  # Each rank processes 16 examples
     total_times = []
     comm_times = []
     
@@ -45,11 +45,11 @@ def distributed_train(rank, world_size):
         # Generate all data on rank 0, broadcast to all ranks
         if rank == 0:
             torch.manual_seed(42 + step)
-            all_input_ids = torch.randint(0, 64, (world_size * local_bs, 64))
-            all_target_ids = torch.randint(0, 64, (world_size * local_bs, 64))
+            all_input_ids = torch.randint(0, 512, (world_size * local_bs, 128))
+            all_target_ids = torch.randint(0, 512, (world_size * local_bs, 128))
         else:
-            all_input_ids = torch.empty((world_size * local_bs, 64), dtype=torch.long)
-            all_target_ids = torch.empty((world_size * local_bs, 64), dtype=torch.long)
+            all_input_ids = torch.empty((world_size * local_bs, 128), dtype=torch.long)
+            all_target_ids = torch.empty((world_size * local_bs, 128), dtype=torch.long)
         
         dist.broadcast(all_input_ids, src=0)
         dist.broadcast(all_target_ids, src=0)
@@ -60,21 +60,21 @@ def distributed_train(rank, world_size):
         target_ids = all_target_ids[offset : offset + local_bs]
         
         outputs = model(input_ids)
-        loss = criterion(outputs.view(-1, 64), target_ids.view(-1))
+        loss = criterion(outputs.view(-1, 512), target_ids.view(-1))
         loss.backward()
         
         # Measure communication time
         comm_start = time.time()
 
-        dense_gradients = [param.grad.data for param in model.parameters()]
-        flat_grads = torch._utils._flatten_dense_tensors(dense_gradients)
-        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM, async_op=False)
-        flat_grads.div_(world_size)
-        torch._utils._unflatten_dense_tensors(flat_grads, dense_gradients)
+        # dense_gradients = [param.grad.data for param in model.parameters()]
+        # flat_grads = torch._utils._flatten_dense_tensors(dense_gradients)
+        # dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM, async_op=False)
+        # flat_grads.div_(world_size)
+        # torch._utils._unflatten_dense_tensors(flat_grads, dense_gradients)
         
-        # for param in model.parameters():
-        #     dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-        #     param.grad.data.div_(world_size)
+        for param in model.parameters():
+            dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+            param.grad.data.div_(world_size)
 
         comm_end = time.time()
         comm_times.append(comm_end - comm_start)
