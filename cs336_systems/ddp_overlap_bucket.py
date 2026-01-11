@@ -1,5 +1,9 @@
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
+import os
+import time
+from cs336_basics.model import BasicsTransformerLM
 
 
 class DDP_bucket(torch.nn.Module):
@@ -77,3 +81,82 @@ class DDP_bucket(torch.nn.Module):
             for p_grad, coalesced in zip(dense_grads, grads_coalesced):
                 p_grad.copy_(coalesced)
             self.work_handles[i] = None
+
+
+def setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29502"
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+
+def distributed_train(rank, world_size, bucket_size_mb):
+    setup(rank, world_size)
+    
+    model = BasicsTransformerLM(
+        vocab_size=512,
+        context_length=128,
+        d_model=256,
+        num_layers=4,
+        num_heads=8,
+        d_ff=1024,
+        rope_theta=100000,
+    )
+    
+    # Wrap with DDP
+    ddp_model = DDP_bucket(model, bucket_size_mb=bucket_size_mb)
+    
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(ddp_model.parameters(), lr=1e-3)
+    ddp_model.train()
+    
+    local_bs = 16  # Each rank processes 16 examples
+    total_times = []
+
+    # warm-up iterations
+    for _ in range(5):
+        optimizer.zero_grad()
+        
+        # Generate all data on rank 0, broadcast to all ranks
+        input_ids = torch.randint(0, 512, (local_bs, 128), dtype=torch.long)
+        target_ids = torch.randint(0, 512, (local_bs, 128), dtype=torch.long)
+        
+        outputs = ddp_model(input_ids)
+        loss = criterion(outputs.view(-1, 512), target_ids.view(-1))
+        loss.backward()
+        ddp_model.finish_gradient_synchronization()
+        optimizer.step()
+    
+    for _ in range(10):
+        optimizer.zero_grad()
+        
+        # Generate all data on rank 0, broadcast to all ranks
+        input_ids = torch.randint(0, 512, (local_bs, 128), dtype=torch.long)
+        target_ids = torch.randint(0, 512, (local_bs, 128), dtype=torch.long)
+        
+        iter_start = time.time()
+        
+        outputs = ddp_model(input_ids)
+        loss = criterion(outputs.view(-1, 512), target_ids.view(-1))
+        loss.backward()
+        ddp_model.finish_gradient_synchronization()
+        optimizer.step()
+        
+        iter_end = time.time()
+        total_times.append(iter_end - iter_start)
+    
+    # Print timing results from rank 0
+    if rank == 0:
+        avg_total = sum(total_times) / len(total_times)
+        print(f"DDP Overlap - Average total time per iteration: {avg_total:.6f} seconds")
+    
+    dist.destroy_process_group()
+
+
+def train_distributed(world_size=4, bucket_size_mb=1.0):
+    mp.spawn(fn=distributed_train, args=(world_size, bucket_size_mb), nprocs=world_size, join=True)
+
+
+if __name__ == "__main__":
+    for bucket_size_mb in [0.01, 1, 10, 100, 1000]:
+        print(f"\nTraining with bucket size: {bucket_size_mb} MB")
+        train_distributed(world_size=2, bucket_size_mb=bucket_size_mb)
